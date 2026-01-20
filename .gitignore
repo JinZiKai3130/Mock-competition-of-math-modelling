@@ -97,11 +97,8 @@ target/
 # VS Code 特定文件
 
 .vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-!.vscode/*.code-snippets
+.myenv/*
+*.cfg
 
 # VS Code 本地历史
 .history/
@@ -151,11 +148,11 @@ Thumbs.db
 *.cert
 *.crt
 
-# 配置文件（根据需要取消注释）
-# config.ini
-# config.yaml
-# config.yml
-# config.json
+配置文件（根据需要取消注释）
+config.ini
+config.yaml
+config.yml
+config.json
 
 
 # 项目特定文件
@@ -221,7 +218,6 @@ data/processed/
 # .flake8
 # .pylintrc
 
-
 # 自定义规则示例：
 # 如果你的项目有特定需求，可以在这里添加
 
@@ -232,3 +228,50 @@ data/processed/
 # 但保留配置文件示例
 # !config.example.yaml
 # !.env.example
+
+
+# 编译输出
+*.out
+*.exe
+*.bin
+*.app
+
+# 对象文件
+*.o
+*.ko
+*.obj
+*.elf
+
+# 预编译头
+*.gch
+*.pch
+
+# 库文件
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+
+# 核心转储
+core
+*.core
+
+# 调试符号
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# 临时文件
+*~
+*.swp
+*.swo
+
+# 构建目录
+build/
+dist/
+bin/
+obj/
+out/
+target/
