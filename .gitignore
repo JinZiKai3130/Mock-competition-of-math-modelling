@@ -99,6 +99,7 @@ target/
 .vscode/*
 .myenv/*
 *.cfg
+lib64
 
 # VS Code 本地历史
 .history/
