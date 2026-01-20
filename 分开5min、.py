@@ -1,6 +1,23 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
+import matplotlib.font_manager as fm
+
+# 使中文可用
+all_fonts = [f.name for f in fm.fontManager.ttflist]
+chinese_fonts = []
+chinese_font_names = ['SimHei', 'Microsoft YaHei', 'KaiTi', 'FangSong', 'SimSun',
+                      'NSimSun', 'YouYuan', 'STXihei', 'STKaiti', 'STSong']
+for font in chinese_font_names:
+    if any(font in f for f in all_fonts):
+        chinese_fonts.append(font)
+
+if chinese_fonts:
+    print(f"Available Chinese fonts: {chinese_fonts}")
+    plt.rcParams['font.sans-serif'] = [chinese_fonts[0]]
+else:
+    print("No Chinese fonts found, using English only")
+plt.rcParams['axes.unicode_minus'] = False
 
 # 读取CSV文件 - 使用原始字符串
 file_path = r"C:\Users\lvsiy\Desktop\模拟MCM\MCM2026 Training Test Problem B\mcm26Train-B-Data\hall_calls.csv"
@@ -18,6 +35,7 @@ time_bins = pd.date_range(start=start_time, end=df['Time'].max(), freq='5min')
 # 统计每个时间区间的呼叫次数
 df['Time_Bin'] = pd.cut(df['Time'], bins=time_bins, right=True, include_lowest=True)
 calls_per_5min = df.groupby('Time_Bin').size().reset_index(name='Call_Count')
+calls_per_5min['Call_Count'] = calls_per_5min['Call_Count'] / 2
 
 # 转换时间区间为更易读的格式
 calls_per_5min['Time_Range'] = calls_per_5min['Time_Bin'].apply(
