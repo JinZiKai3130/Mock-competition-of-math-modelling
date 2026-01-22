@@ -97,9 +97,7 @@ target/
 # VS Code 特定文件
 
 .vscode/*
-.myenv/*
-*.cfg
-lib64
+/myenv/
 
 # VS Code 本地历史
 .history/
