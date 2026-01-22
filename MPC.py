@@ -1,846 +1,890 @@
+"""
+电梯MPC停车策略优化系统 v2.0
+基于完整的电梯运行数据进行分析和优化
+"""
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
-import cvxpy as cp
-from datetime import datetime
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
 
-# 加载数据
-weekday_data = pd.read_csv('MCM2026 Training Test Problem B/hall_calls_5min_weekday_avg.csv', encoding='utf-8-sig')
-weekend_data = pd.read_csv('MCM2026 Training Test Problem B/hall_calls_5min_weekend_avg.csv', encoding='utf-8-sig')
+# 设置中文显示
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
-# 定义时间段
-time_periods = {
-    'A': ('07:00', '09:30'),  # 早高峰
-    'B': ('09:30', '11:00'),  # 早餐时间
-    'C': ('11:00', '13:30'),  # 午餐时间
-    'D': ('13:30', '17:00'),  # 办公时间
-    'E': ('17:00', '18:00'),  # 晚高峰
-    'F': ('18:00', '20:00'),  # 晚餐时间
-    'G': ('20:00', '22:00'),  # 晚间休闲
-    'H': ('22:00', '07:00')   # 夜间
-}
 
-def time_to_minutes(t):
-    """将时间字符串转换为分钟数"""
-    h, m = map(int, t.split(':'))
-    return h * 60 + m
-
-def get_period_data(df, period):
-    """获取指定时间段的数据"""
-    start_str, end_str = time_periods[period]
-    start_min = time_to_minutes(start_str)
-    end_min = time_to_minutes(end_str)
+class ElevatorDataAnalyzer:
+    """电梯数据分析器 - 从原始数据中提取模式"""
     
-    # 处理跨天的时间段
-    if start_min > end_min:  # 跨天，如H段22:00-07:00
-        mask = (df['time_of_day'].apply(time_to_minutes) >= start_min) | \
-               (df['time_of_day'].apply(time_to_minutes) < end_min)
-    else:
-        mask = (df['time_of_day'].apply(time_to_minutes) >= start_min) & \
-               (df['time_of_day'].apply(time_to_minutes) < end_min)
+    def __init__(self):
+        self.hall_calls = None
+        self.car_calls = None
+        self.car_stops = None
+        self.car_departures = None
+        self.load_changes = None
+        self.maintenance = None
+        
+        # 时间段定义
+        self.time_periods = {
+            'A': ('07:00', '09:30'),  # 早高峰
+            'B': ('09:30', '11:00'),  # 上午
+            'C': ('11:00', '13:30'),  # 午餐时间
+            'D': ('13:30', '17:00'),  # 下午办公
+            'E': ('17:00', '18:00'),  # 晚高峰
+            'F': ('18:00', '20:00'),  # 晚餐时间
+            'G': ('20:00', '22:00'),  # 晚间
+            'H': ('22:00', '07:00')   # 夜间
+        }
+        
+        # 电梯ID列表
+        self.elevator_ids = ['A', 'B', 'C', 'D', 'F', 'G', 'H', 'I']
+        self.num_floors = 14
+        self.num_elevators = len(self.elevator_ids)
+        
+    def _read_csv_with_encoding(self, filepath):
+        """尝试多种编码读取CSV文件"""
+        encodings = ['utf-8-sig', 'utf-8', 'gbk', 'gb2312', 'latin-1', 'cp1252']
+        
+        for encoding in encodings:
+            try:
+                df = pd.read_csv(filepath, encoding=encoding)
+                return df
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+            except Exception as e:
+                # 其他错误直接抛出
+                if 'codec' not in str(e).lower():
+                    raise e
+                continue
+        
+        # 最后尝试忽略错误
+        return pd.read_csv(filepath, encoding='utf-8', errors='ignore')
     
-    return df[mask]
-
-# 分析每个时间段的平均呼叫模式
-def analyze_period_pattern(df, period_name):
-    """分析特定时间段的呼叫模式"""
-    period_data = get_period_data(df, period_name)
+    def load_data(self):
+        """加载所有数据文件"""
+        print("正在加载数据...")
+        
+        # 加载厅外呼叫数据
+        self.hall_calls = self._read_csv_with_encoding('MCM2026 Training Test Problem B/hall_calls.csv')
+        self.hall_calls['Time'] = pd.to_datetime(self.hall_calls['Time'])
+        print(f"  厅外呼叫数据: {len(self.hall_calls)} 条记录")
+        
+        # 加载轿厢呼叫数据
+        self.car_calls = self._read_csv_with_encoding('MCM2026 Training Test Problem B/car_calls.csv')
+        self.car_calls['Time'] = pd.to_datetime(self.car_calls['Time'])
+        print(f"  轿厢呼叫数据: {len(self.car_calls)} 条记录")
+        
+        # 加载停靠数据
+        self.car_stops = self._read_csv_with_encoding('MCM2026 Training Test Problem B/car_stops.csv')
+        self.car_stops['Time'] = pd.to_datetime(self.car_stops['Time'])
+        print(f"  停靠数据: {len(self.car_stops)} 条记录")
+        
+        # 加载出发数据
+        self.car_departures = self._read_csv_with_encoding('MCM2026 Training Test Problem B/car_departures.csv')
+        self.car_departures['Time'] = pd.to_datetime(self.car_departures['Time'])
+        print(f"  出发数据: {len(self.car_departures)} 条记录")
+        
+        # 加载载重变化数据
+        self.load_changes = self._read_csv_with_encoding('MCM2026 Training Test Problem B/load_changes.csv')
+        self.load_changes['Time'] = pd.to_datetime(self.load_changes['Time'])
+        print(f"  载重变化数据: {len(self.load_changes)} 条记录")
+        
+        # 加载维护模式数据
+        self.maintenance = self._read_csv_with_encoding('MCM2026 Training Test Problem B/maintenance_mode.csv')
+        self.maintenance['Time'] = pd.to_datetime(self.maintenance['Time'])
+        print(f"  维护模式数据: {len(self.maintenance)} 条记录")
+        
+        print("数据加载完成!")
+        
+    def get_time_period(self, time):
+        """获取时间对应的时间段"""
+        hour = time.hour
+        minute = time.minute
+        time_minutes = hour * 60 + minute
+        
+        for period, (start, end) in self.time_periods.items():
+            start_h, start_m = map(int, start.split(':'))
+            end_h, end_m = map(int, end.split(':'))
+            start_min = start_h * 60 + start_m
+            end_min = end_h * 60 + end_m
+            
+            if start_min > end_min:  # 跨天
+                if time_minutes >= start_min or time_minutes < end_min:
+                    return period
+            else:
+                if start_min <= time_minutes < end_min:
+                    return period
+        return 'H'  # 默认夜间
     
-    if len(period_data) == 0:
-        return None
+    def analyze_hall_call_patterns(self):
+        """分析厅外呼叫模式"""
+        print("\n分析厅外呼叫模式...")
+        
+        # 提取有效的楼层呼叫（Floor字段非空）
+        valid_calls = self.hall_calls[self.hall_calls['Floor'].notna()].copy()
+        
+        # 解析楼层（可能是逗号分隔的多个楼层）
+        def parse_floors(floor_str):
+            if pd.isna(floor_str):
+                return []
+            try:
+                return [int(f.strip()) for f in str(floor_str).split(',') if f.strip().isdigit()]
+            except:
+                return []
+        
+        valid_calls['ParsedFloors'] = valid_calls['Floor'].apply(parse_floors)
+        
+        # 展开楼层列表
+        expanded_calls = []
+        for _, row in valid_calls.iterrows():
+            for floor in row['ParsedFloors']:
+                if 1 <= floor <= self.num_floors:
+                    expanded_calls.append({
+                        'Time': row['Time'],
+                        'Elevator ID': row['Elevator ID'],
+                        'Direction': row['Direction'],
+                        'Floor': floor,
+                        'Hour': row['Time'].hour,
+                        'DayOfWeek': row['Time'].dayofweek,
+                        'Period': self.get_time_period(row['Time'])
+                    })
+        
+        self.expanded_hall_calls = pd.DataFrame(expanded_calls)
+        print(f"  展开后的呼叫记录: {len(self.expanded_hall_calls)} 条")
+        
+        # 按时间段和楼层统计呼叫次数
+        self.call_patterns = {}
+        for period in self.time_periods.keys():
+            period_data = self.expanded_hall_calls[self.expanded_hall_calls['Period'] == period]
+            
+            # 分工作日和周末
+            weekday_data = period_data[period_data['DayOfWeek'] < 5]
+            weekend_data = period_data[period_data['DayOfWeek'] >= 5]
+            
+            # 统计每个楼层的呼叫次数
+            weekday_floor_counts = weekday_data.groupby('Floor').size()
+            weekend_floor_counts = weekend_data.groupby('Floor').size()
+            
+            # 填充所有楼层
+            weekday_counts = np.zeros(self.num_floors)
+            weekend_counts = np.zeros(self.num_floors)
+            
+            for floor, count in weekday_floor_counts.items():
+                if 1 <= floor <= self.num_floors:
+                    weekday_counts[floor-1] = count
+            for floor, count in weekend_floor_counts.items():
+                if 1 <= floor <= self.num_floors:
+                    weekend_counts[floor-1] = count
+            
+            # 计算每5分钟的平均呼叫次数
+            period_duration = self._get_period_duration(period)
+            num_weekdays = len(weekday_data['Time'].dt.date.unique()) if len(weekday_data) > 0 else 1
+            num_weekends = len(weekend_data['Time'].dt.date.unique()) if len(weekend_data) > 0 else 1
+            
+            weekday_rate = weekday_counts / (num_weekdays * period_duration / 5) if num_weekdays > 0 else weekday_counts
+            weekend_rate = weekend_counts / (num_weekends * period_duration / 5) if num_weekends > 0 else weekend_counts
+            
+            self.call_patterns[period] = {
+                'weekday': {
+                    'total_calls': weekday_counts.sum(),
+                    'floor_counts': weekday_counts,
+                    'rate_per_5min': weekday_rate,
+                    'distribution': weekday_counts / weekday_counts.sum() if weekday_counts.sum() > 0 else np.ones(self.num_floors) / self.num_floors
+                },
+                'weekend': {
+                    'total_calls': weekend_counts.sum(),
+                    'floor_counts': weekend_counts,
+                    'rate_per_5min': weekend_rate,
+                    'distribution': weekend_counts / weekend_counts.sum() if weekend_counts.sum() > 0 else np.ones(self.num_floors) / self.num_floors
+                }
+            }
+            
+            print(f"  {period}段: 工作日{weekday_counts.sum():.0f}次, 周末{weekend_counts.sum():.0f}次")
+        
+        return self.call_patterns
     
-    # 计算每个楼层的平均呼叫次数
-    floor_cols = [f'楼层{i}' for i in range(1, 15)]
-    avg_calls = period_data[floor_cols].mean()
+    def _get_period_duration(self, period):
+        """获取时间段时长（分钟）"""
+        durations = {
+            'A': 150, 'B': 90, 'C': 150, 'D': 210,
+            'E': 60, 'F': 120, 'G': 120, 'H': 540
+        }
+        return durations.get(period, 60)
     
-    # 计算总呼叫次数
-    total_calls = period_data['总次数'].mean()
+    def analyze_elevator_travel_times(self):
+        """分析电梯运行时间"""
+        print("\n分析电梯运行时间...")
+        
+        # 合并停靠和出发数据，计算在每层的停留时间
+        stops = self.car_stops.copy()
+        departures = self.car_departures.copy()
+        
+        # 按电梯和时间排序
+        stops = stops.sort_values(['Elevator ID', 'Time'])
+        departures = departures.sort_values(['Elevator ID', 'Time'])
+        
+        # 计算停留时间
+        dwell_times = []
+        for elevator in self.elevator_ids:
+            elev_stops = stops[stops['Elevator ID'] == elevator]
+            elev_deps = departures[departures['Elevator ID'] == elevator]
+            
+            for _, stop in elev_stops.iterrows():
+                # 找到该停靠之后最近的出发
+                next_deps = elev_deps[(elev_deps['Time'] > stop['Time']) & 
+                                       (elev_deps['Floor'] == stop['Floor'])]
+                if len(next_deps) > 0:
+                    dep_time = next_deps.iloc[0]['Time']
+                    dwell = (dep_time - stop['Time']).total_seconds()
+                    if 0 < dwell < 300:  # 过滤异常值（0-5分钟）
+                        dwell_times.append({
+                            'elevator': elevator,
+                            'floor': stop['Floor'],
+                            'dwell_time': dwell,
+                            'car_call': stop['Stop Reason - Car Call'],
+                            'hall_call': stop['Stop Reason - Hall Call']
+                        })
+        
+        self.dwell_times_df = pd.DataFrame(dwell_times)
+        
+        # 计算平均停留时间
+        avg_dwell = self.dwell_times_df['dwell_time'].mean()
+        print(f"  平均停留时间: {avg_dwell:.1f}秒")
+        
+        # 估算层间运行时间（从连续停靠计算）
+        travel_times = []
+        for elevator in self.elevator_ids:
+            elev_stops = stops[stops['Elevator ID'] == elevator].sort_values('Time')
+            for i in range(1, len(elev_stops)):
+                prev = elev_stops.iloc[i-1]
+                curr = elev_stops.iloc[i]
+                
+                floor_diff = abs(curr['Floor'] - prev['Floor'])
+                time_diff = (curr['Time'] - prev['Time']).total_seconds()
+                
+                if floor_diff > 0 and 0 < time_diff < 120:  # 过滤异常
+                    travel_times.append({
+                        'floors': floor_diff,
+                        'time': time_diff,
+                        'speed': floor_diff / time_diff if time_diff > 0 else 0
+                    })
+        
+        self.travel_times_df = pd.DataFrame(travel_times)
+        avg_speed = self.travel_times_df['speed'].mean()
+        print(f"  估算电梯速度: {avg_speed:.3f}层/秒")
+        
+        self.elevator_params = {
+            'avg_dwell_time': avg_dwell,
+            'avg_speed': avg_speed,
+            'door_time': 8.0  # 估算开关门时间
+        }
+        
+        return self.elevator_params
     
-    # 计算呼叫分布
-    distribution = avg_calls / avg_calls.sum() if avg_calls.sum() > 0 else np.zeros_like(avg_calls)
+    def analyze_passenger_load(self):
+        """分析乘客载重模式"""
+        print("\n分析乘客载重模式...")
+        
+        loads = self.load_changes.copy()
+        loads['Hour'] = loads['Time'].dt.hour
+        loads['Period'] = loads['Time'].apply(self.get_time_period)
+        loads['DayOfWeek'] = loads['Time'].dt.dayofweek
+        
+        # 估算人数（假设平均每人70kg）
+        avg_weight_per_person = 70
+        loads['Passengers_In'] = loads['Load In (kg)'] / avg_weight_per_person
+        loads['Passengers_Out'] = loads['Load Out (kg)'] / avg_weight_per_person
+        
+        # 按时间段和楼层统计
+        self.load_patterns = {}
+        for period in self.time_periods.keys():
+            period_data = loads[loads['Period'] == period]
+            
+            # 每层的上下客人数
+            floor_in = period_data.groupby('Floor')['Passengers_In'].sum()
+            floor_out = period_data.groupby('Floor')['Passengers_Out'].sum()
+            
+            passengers_in = np.zeros(self.num_floors)
+            passengers_out = np.zeros(self.num_floors)
+            
+            for floor, count in floor_in.items():
+                if 1 <= floor <= self.num_floors:
+                    passengers_in[floor-1] = count
+            for floor, count in floor_out.items():
+                if 1 <= floor <= self.num_floors:
+                    passengers_out[floor-1] = count
+            
+            self.load_patterns[period] = {
+                'passengers_in': passengers_in,
+                'passengers_out': passengers_out,
+                'net_flow': passengers_in - passengers_out
+            }
+            
+            print(f"  {period}段: 上客{passengers_in.sum():.0f}人, 下客{passengers_out.sum():.0f}人")
+        
+        return self.load_patterns
     
-    return {
-        'period': period_name,
-        'total_calls': total_calls,
-        'avg_calls': avg_calls.values,
-        'distribution': distribution.values,
-        'peak_floors': avg_calls.nlargest(3).index.tolist()
-    }
-
-# 分析周中各个时间段
-weekday_patterns = {}
-for period in time_periods.keys():
-    pattern = analyze_period_pattern(weekday_data, period)
-    if pattern:
-        weekday_patterns[period] = pattern
-        print(f"周中{period}段: 总呼叫{pattern['total_calls']:.1f}, 高峰楼层: {pattern['peak_floors']}")
-
-# 分析周末各个时间段（除了H段，其他时间段使用周末数据，但模式可能不同）
-weekend_patterns = {}
-for period in time_periods.keys():
-    if period == 'H':  # 夜间模式相同
-        # 确保weekday_patterns中有H段数据
-        if period in weekday_patterns:
-            weekend_patterns[period] = weekday_patterns[period]
-        else:
-            weekend_patterns[period] = None
-    else:
-        pattern = analyze_period_pattern(weekend_data, period)
-        if pattern:
-            weekend_patterns[period] = pattern
-            print(f"周末{period}段: 总呼叫{pattern['total_calls']:.1f}, 高峰楼层: {pattern['peak_floors']}")
+    def get_peak_floors(self, period, is_weekday=True, top_n=5):
+        """获取指定时间段的高需求楼层"""
+        day_type = 'weekday' if is_weekday else 'weekend'
+        if period in self.call_patterns:
+            distribution = self.call_patterns[period][day_type]['distribution']
+            top_indices = np.argsort(distribution)[-top_n:][::-1]
+            return top_indices + 1  # 转换为1-based楼层号
+        return np.array([1, 7, 8, 9, 10])  # 默认值
 
 
 class ElevatorMPCController:
-    """基于MPC的电梯停车控制器"""
+    """基于MPC的电梯停车控制器 v2.0"""
     
-    def __init__(self, num_elevators=6, num_floors=14, prediction_horizon=3):
+    def __init__(self, data_analyzer):
         """
         初始化MPC控制器
         
         参数:
-        - num_elevators: 电梯数量
-        - num_floors: 楼层数
-        - prediction_horizon: MPC预测步数
+        - data_analyzer: ElevatorDataAnalyzer实例
         """
-        self.E = num_elevators
-        self.F = num_floors
-        self.N = prediction_horizon
+        self.analyzer = data_analyzer
+        self.E = data_analyzer.num_elevators
+        self.F = data_analyzer.num_floors
+        self.N = 3  # MPC预测步数
         
-        # 电梯参数
-        self.speed = 0.3  # 层/秒
-        self.door_time = 10  # 开关门时间(秒)
-        self.load_time_per_person = 2  # 每人上下时间(秒)
+        # 从数据分析中获取电梯参数
+        if hasattr(data_analyzer, 'elevator_params'):
+            self.speed = data_analyzer.elevator_params.get('avg_speed', 0.3)
+            self.door_time = data_analyzer.elevator_params.get('door_time', 8.0)
+            self.dwell_time = data_analyzer.elevator_params.get('avg_dwell_time', 15.0)
+        else:
+            self.speed = 0.3
+            self.door_time = 8.0
+            self.dwell_time = 15.0
         
         # 成本权重
         self.weights = {
-            'waiting_time': 10.0,  # 等待时间权重
-            'energy': 0.1,         # 能耗权重
-            'movement': 0.5,       # 移动成本权重
-            'idle_cost': 0.01      # 空闲成本
+            'waiting_time': 10.0,
+            'energy': 0.1,
+            'movement': 0.5,
+            'coverage': 2.0
         }
         
-        # 当前状态
-        self.current_time = 0
+        # 电梯状态
         self.elevator_states = None
-        self.passenger_queue = []
         
     def initialize_elevators(self, initial_positions=None):
         """初始化电梯状态"""
         if initial_positions is None:
-            # 默认均匀分布在中间楼层
-            initial_positions = np.linspace(2, self.F-1, self.E, dtype=int)
+            # 默认均匀分布
+            initial_positions = np.linspace(1, self.F, self.E, dtype=int)
         
         self.elevator_states = []
         for i in range(self.E):
+            pos = initial_positions[i] if i < len(initial_positions) else self.F // 2
             self.elevator_states.append({
-                'id': i,
-                'current_floor': initial_positions[i],
-                'target_floor': initial_positions[i],
-                'direction': 0,  # -1:下, 0:静止, 1:上
-                'status': 'idle',  # idle, moving, loading, unloading
-                'passengers': 0,
-                'capacity': 10,
-                'time_to_next_action': 0
+                'id': self.analyzer.elevator_ids[i] if i < len(self.analyzer.elevator_ids) else f'E{i}',
+                'current_floor': int(pos),
+                'target_floor': int(pos),
+                'direction': 0,
+                'status': 'idle',
+                'passengers': 0
             })
     
-    def predict_passenger_arrivals(self, current_pattern, current_time_in_period, num_steps):
+    def predict_demand(self, period, is_weekday=True, num_steps=3):
         """
-        预测未来乘客到达
+        基于历史数据预测乘客需求
         
         参数:
-        - current_pattern: 当前时间段的呼叫模式
-        - current_time_in_period: 在当前时间段内的分钟数
+        - period: 时间段
+        - is_weekday: 是否工作日
         - num_steps: 预测步数
         
         返回:
-        - 预测的乘客到达矩阵 (num_steps × F)
+        - 预测的需求矩阵 (num_steps × F)
         """
         predictions = np.zeros((num_steps, self.F))
         
-        if current_pattern is None:
-            return predictions
+        day_type = 'weekday' if is_weekday else 'weekend'
         
-        avg_calls = current_pattern['avg_calls']
-        if avg_calls is None or len(avg_calls) == 0:
-            return predictions
-        
-        # 基于历史模式预测，考虑时间变化
-        base_rate = np.array(avg_calls) / 5  # 转换为每分钟的呼叫率
-        # 确保base_rate是非负的
-        base_rate = np.maximum(0, np.nan_to_num(base_rate, nan=0.0))
-        
-        for step in range(num_steps):
-            # 考虑时间因素（例如高峰时段需求更高）
-            time_factor = 1.0
-            predicted_time = current_time_in_period + step * 5  # 每步5分钟
+        if period in self.analyzer.call_patterns:
+            base_rate = self.analyzer.call_patterns[period][day_type]['rate_per_5min']
+            base_rate = np.maximum(0, np.nan_to_num(base_rate, nan=0.0))
             
-            # 简单的线性时间因子（可根据实际情况调整）
-            if predicted_time < 30:  # 前半段
-                time_factor = 1.0 + 0.5 * (predicted_time / 30)
-            else:  # 后半段
-                time_factor = 1.5 - 0.5 * ((predicted_time - 30) / 30)
-            
-            # 生成预测（确保非负）
-            predictions[step, :] = np.maximum(0, base_rate * time_factor * 5 + 
-                                            np.random.normal(0, 0.1, self.F))
+            for step in range(num_steps):
+                # 添加随机扰动模拟不确定性
+                noise = np.random.normal(0, 0.1, self.F)
+                predictions[step, :] = np.maximum(0, base_rate + noise)
         
         return predictions
     
-    def calculate_waiting_time_estimate(self, elevator_positions, passenger_matrix):
+    def calculate_expected_wait_time(self, elevator_positions, demand_distribution):
         """
         计算预期等待时间
         
         参数:
-        - elevator_positions: 电梯位置列表
-        - passenger_matrix: 乘客到达矩阵 (N × F)
+        - elevator_positions: 电梯位置数组
+        - demand_distribution: 需求分布
         
         返回:
         - 总预期等待时间
         """
-        total_waiting = 0
-        N = passenger_matrix.shape[0]
+        total_wait = 0
         
-        for t in range(N):
-            for f in range(self.F):
-                passengers = passenger_matrix[t, f]
-                if passengers > 0:
-                    # 找到最近的空闲电梯
-                    distances = []
-                    for e_pos in elevator_positions:
-                        # 计算距离（楼层差）
-                        distance = abs(e_pos - (f + 1))
-                        # 转换为时间（移动时间 + 可能的方向调整时间）
-                        travel_time = distance / self.speed
-                        # 假设需要额外时间响应
-                        response_time = travel_time + self.door_time + 2
-                        distances.append(response_time)
-                    
-                    if distances:
-                        min_wait = min(distances)
-                        total_waiting += passengers * min_wait
-        
-        return total_waiting
-    
-    def build_mpc_optimization(self, current_states, passenger_predictions):
-        """
-        构建MPC优化问题
-        
-        参数:
-        - current_states: 当前电梯状态列表
-        - passenger_predictions: 乘客到达预测 (N × F)
-        
-        返回:
-        - 最优控制序列
-        """
-        # 创建决策变量
-        # 每部电梯在每个时间步的目标楼层
-        X = cp.Variable((self.N, self.E))  # 目标楼层
-        
-        # 成本函数
-        cost = 0
-        
-        # 计算需求权重向量（用于引导电梯到高需求楼层）
-        # 归一化需求分布
-        demand_weights = passenger_predictions.sum(axis=0)  # 各楼层总需求
-        if demand_weights.max() > 0:
-            demand_weights = demand_weights / demand_weights.max()
-        
-        # 预测未来的状态和成本
-        for k in range(self.N):
-            # 等待时间成本：使用凸优化兼容的形式
-            # 鼓励电梯靠近高需求楼层
-            for e in range(self.E):
-                # 对每个楼层，计算电梯到该楼层的距离乘以需求权重
-                for f in range(self.F):
-                    floor_num = f + 1
-                    demand = passenger_predictions[k, f] if k < passenger_predictions.shape[0] else 0
-                    # 距离越远、需求越高，成本越大
-                    cost += self.weights['waiting_time'] * demand * cp.abs(X[k, e] - floor_num) / self.E
-            
-            # 移动成本（避免频繁移动）
-            if k == 0:
-                # 第一步：从当前位置移动的成本
-                for e in range(self.E):
-                    current_pos = current_states[e]['current_floor']
-                    cost += self.weights['movement'] * cp.square(X[k, e] - current_pos)
-                    cost += self.weights['energy'] * cp.abs(X[k, e] - current_pos)
-            else:
-                movement = cp.sum_squares(X[k, :] - X[k-1, :])
-                cost += self.weights['movement'] * movement
-                energy_cost = cp.sum(cp.abs(X[k, :] - X[k-1, :]))
-                cost += self.weights['energy'] * energy_cost
-        
-        # 鼓励电梯分散分布（使用DCP兼容的方式）
-        # 方法：鼓励电梯位置覆盖不同区域，通过最小化与理想分布位置的偏差
-        # 理想分布：均匀分布在各楼层
-        ideal_positions = np.linspace(1, self.F, self.E)
-        spread_weight = 0.5
-        for k in range(self.N):
-            # 鼓励电梯接近理想的均匀分布位置
-            for e in range(self.E):
-                cost += spread_weight * cp.square(X[k, e] - ideal_positions[e])
-        
-        # 约束条件
-        constraints = []
-        
-        # 楼层范围约束
-        constraints.append(X >= 1)
-        constraints.append(X <= self.F)
-        
-        # 初始位置约束（第一步必须可达）
-        for e in range(self.E):
-            current_pos = current_states[e]['current_floor']
-            max_move = 5 * self.speed * 60  # 5分钟内最大移动楼层数
-            constraints.append(cp.abs(X[0, e] - current_pos) <= max_move)
-        
-        # 解决优化问题
-        problem = cp.Problem(cp.Minimize(cost), constraints)
-        
-        try:
-            # 尝试使用ECOS求解器
-            problem.solve(solver=cp.ECOS, verbose=False)
-            
-            if problem.status in ['optimal', 'optimal_inaccurate']:
-                # 获取最优解并四舍五入到整数楼层
-                optimal_targets = np.round(X.value[0, :]).astype(int)
-                # 确保在有效范围内
-                optimal_targets = np.clip(optimal_targets, 1, self.F)
-                return optimal_targets
-            else:
-                print(f"优化状态: {problem.status}")
-                # 返回启发式解
-                return self.heuristic_parking(current_states, passenger_predictions[0, :])
+        for floor in range(self.F):
+            demand = demand_distribution[floor]
+            if demand > 0:
+                # 计算到最近电梯的距离
+                distances = [abs(pos - (floor + 1)) for pos in elevator_positions]
+                min_distance = min(distances)
                 
-        except Exception as e:
-            print(f"优化失败: {e}")
-            return self.heuristic_parking(current_states, passenger_predictions[0, :])
+                # 等待时间 = 移动时间 + 开门时间
+                travel_time = min_distance / self.speed if self.speed > 0 else 0
+                wait_time = travel_time + self.door_time
+                
+                total_wait += demand * wait_time
+        
+        return total_wait
     
-    def heuristic_parking(self, current_states, current_demand):
+    def optimize_parking_positions(self, period, is_weekday=True):
         """
-        启发式停车策略（备用）
+        优化电梯停车位置
         
         参数:
-        - current_states: 当前电梯状态
-        - current_demand: 当前需求向量
+        - period: 时间段
+        - is_weekday: 是否工作日
         
         返回:
-        - 目标楼层列表
+        - 最优停车位置
         """
-        targets = []
+        # 获取需求预测
+        demand_predictions = self.predict_demand(period, is_weekday, self.N)
+        avg_demand = demand_predictions.mean(axis=0)
         
-        # 确保current_demand是有效的numpy数组
-        if current_demand is None or len(current_demand) == 0:
-            current_demand = np.ones(self.F)
+        # 获取当前位置
+        current_positions = [e['current_floor'] for e in self.elevator_states]
+        
+        def objective(positions):
+            """目标函数：最小化总成本"""
+            positions = np.clip(positions, 1, self.F)
+            
+            # 等待时间成本
+            wait_cost = self.calculate_expected_wait_time(positions, avg_demand)
+            
+            # 移动成本
+            move_cost = sum(abs(positions[i] - current_positions[i]) for i in range(len(positions)))
+            
+            # 覆盖成本（鼓励电梯分散）
+            coverage_cost = 0
+            for i in range(len(positions)):
+                for j in range(i+1, len(positions)):
+                    # 如果两个电梯太近，增加成本
+                    dist = abs(positions[i] - positions[j])
+                    if dist < 2:
+                        coverage_cost += (2 - dist) ** 2
+            
+            total = (self.weights['waiting_time'] * wait_cost + 
+                    self.weights['movement'] * move_cost +
+                    self.weights['coverage'] * coverage_cost)
+            
+            return total
+        
+        # 初始猜测：基于需求分布
+        x0 = self._get_demand_based_initial_positions(avg_demand)
+        
+        # 约束：楼层范围
+        bounds = [(1, self.F) for _ in range(self.E)]
+        
+        # 优化
+        result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
+        
+        if result.success:
+            optimal_positions = np.round(result.x).astype(int)
+            optimal_positions = np.clip(optimal_positions, 1, self.F)
+        else:
+            # 使用启发式方法
+            optimal_positions = self._heuristic_parking(avg_demand)
+        
+        return optimal_positions
+    
+    def _get_demand_based_initial_positions(self, demand):
+        """基于需求分布生成初始位置"""
+        positions = []
         
         # 按需求排序楼层
-        sorted_floors = np.argsort(current_demand)[::-1]  # 降序
+        sorted_floors = np.argsort(demand)[::-1]
         
-        # 为每部电梯分配目标楼层
-        for i, elevator in enumerate(current_states):
-            if elevator['status'] == 'idle':
-                # 选择未被占用的高需求楼层
-                found = False
-                for floor_idx in sorted_floors:
-                    floor = int(floor_idx) + 1
-                    if floor not in targets:  # 避免多部电梯去同一楼层
-                        targets.append(floor)
-                        found = True
-                        break
-                if not found:
-                    # 如果没有合适楼层，停在当前位置
-                    targets.append(int(elevator['current_floor']))
+        for i in range(self.E):
+            if i < len(sorted_floors):
+                floor = sorted_floors[i % len(sorted_floors)] + 1
             else:
-                # 忙碌电梯保持原目标
-                targets.append(int(elevator['target_floor']))
+                floor = self.F // 2
+            
+            # 避免重复
+            while floor in positions and len(positions) < self.F:
+                floor = floor % self.F + 1
+            
+            positions.append(floor)
         
-        # 确保返回正确数量的目标
-        while len(targets) < self.E:
-            targets.append(int(self.F // 2))  # 默认中间楼层
-        
-        return np.array(targets[:self.E], dtype=int)
+        return np.array(positions)
     
-    def update_elevator_states(self, optimal_targets, dt=60):
-        """
-        更新电梯状态
+    def _heuristic_parking(self, demand):
+        """启发式停车策略"""
+        positions = []
         
-        参数:
-        - optimal_targets: 最优目标楼层
-        - dt: 时间步长(秒)
-        """
+        # 确保demand有效
+        demand = np.maximum(0, np.nan_to_num(demand, nan=0.0))
+        
+        # 按需求排序
+        sorted_floors = np.argsort(demand)[::-1]
+        
+        for i in range(self.E):
+            if i < len(sorted_floors):
+                floor = int(sorted_floors[i]) + 1
+            else:
+                floor = self.F // 2
+            
+            # 避免重复
+            while floor in positions:
+                floor = (floor % self.F) + 1
+            
+            positions.append(floor)
+        
+        return np.array(positions[:self.E])
+    
+    def update_states(self, new_positions):
+        """更新电梯状态"""
         for i, elevator in enumerate(self.elevator_states):
-            target_floor = optimal_targets[i]
-            
-            if elevator['status'] == 'idle':
-                if target_floor != elevator['current_floor']:
-                    # 开始移动
-                    elevator['status'] = 'moving'
-                    elevator['target_floor'] = target_floor
-                    elevator['direction'] = 1 if target_floor > elevator['current_floor'] else -1
-                    
-                    # 计算移动时间
-                    distance = abs(target_floor - elevator['current_floor'])
-                    travel_time = distance / self.speed
-                    elevator['time_to_next_action'] = travel_time
-                else:
-                    # 保持空闲
-                    elevator['time_to_next_action'] = dt
-            
-            elif elevator['status'] == 'moving':
-                # 更新移动进度
-                elevator['time_to_next_action'] -= dt
-                
-                if elevator['time_to_next_action'] <= 0:
-                    # 到达目标楼层
-                    elevator['current_floor'] = elevator['target_floor']
-                    elevator['status'] = 'idle'
-                    elevator['direction'] = 0
-                    elevator['time_to_next_action'] = 0
+            if i < len(new_positions):
+                elevator['target_floor'] = int(new_positions[i])
+                elevator['current_floor'] = int(new_positions[i])
+                elevator['status'] = 'idle'
     
-    def simulate_period(self, pattern, period_duration_minutes, is_weekday=True):
+    def simulate_period(self, period, duration_minutes, is_weekday=True):
         """
         模拟一个时间段的运行
         
         参数:
-        - pattern: 时间段模式
-        - period_duration_minutes: 时间段时长(分钟)
-        - is_weekday: 是否为工作日
+        - period: 时间段
+        - duration_minutes: 时长（分钟）
+        - is_weekday: 是否工作日
         
         返回:
         - 性能统计
         """
-        # 初始化性能统计
-        total_waiting_time = 0
+        total_wait_time = 0
         total_passengers = 0
         total_movement = 0
-        decisions_made = 0
+        decisions = 0
         
-        # 模拟循环（每5分钟做一个决策）
-        simulation_steps = period_duration_minutes // 5
+        steps = duration_minutes // 5
         
-        for step in range(simulation_steps):
-            current_time_in_period = step * 5  # 分钟
+        for step in range(steps):
+            # 预测需求
+            demand = self.predict_demand(period, is_weekday, 1)[0]
             
-            # 生成实际乘客到达（基于模式加随机噪声）
-            actual_arrivals = self.generate_actual_arrivals(pattern, current_time_in_period)
+            # 优化停车位置
+            old_positions = [e['current_floor'] for e in self.elevator_states]
+            optimal_positions = self.optimize_parking_positions(period, is_weekday)
             
-            # 预测未来乘客到达
-            predictions = self.predict_passenger_arrivals(
-                pattern, current_time_in_period, self.N
-            )
-            
-            # 求解MPC优化问题
-            optimal_targets = self.build_mpc_optimization(
-                self.elevator_states, predictions
-            )
-            
-            # 记录决策
-            decisions_made += 1
-            
-            # 计算当前步的等待时间
-            step_waiting = self.simulate_step_waiting(actual_arrivals)
-            total_waiting_time += step_waiting
-            total_passengers += np.sum(actual_arrivals)
+            # 计算等待时间
+            wait = self.calculate_expected_wait_time(optimal_positions, demand)
+            total_wait_time += wait
+            total_passengers += demand.sum()
             
             # 计算移动距离
-            for i, elevator in enumerate(self.elevator_states):
-                if optimal_targets[i] != elevator['current_floor']:
-                    total_movement += abs(optimal_targets[i] - elevator['current_floor'])
+            for i in range(len(optimal_positions)):
+                if i < len(old_positions):
+                    total_movement += abs(optimal_positions[i] - old_positions[i])
             
-            # 更新电梯状态
-            self.update_elevator_states(optimal_targets, dt=300)  # 5分钟=300秒
+            # 更新状态
+            self.update_states(optimal_positions)
+            decisions += 1
         
-        # 计算性能指标
-        avg_waiting_time = total_waiting_time / max(total_passengers, 1)
-        avg_movement_per_decision = total_movement / max(decisions_made, 1)
+        avg_wait = total_wait_time / max(total_passengers, 1)
         
         return {
-            'avg_waiting_time': avg_waiting_time,
+            'avg_waiting_time': avg_wait,
             'total_passengers': total_passengers,
             'total_movement': total_movement,
-            'decisions_made': decisions_made,
+            'decisions_made': decisions,
             'final_positions': [e['current_floor'] for e in self.elevator_states]
         }
-    
-    def generate_actual_arrivals(self, pattern, current_time):
-        """生成实际乘客到达（模拟真实情况）"""
-        if pattern is None:
-            return np.zeros(self.F)
-        
-        # 基于模式生成，添加随机性
-        avg_calls = pattern['avg_calls']
-        
-        # 确保avg_calls是有效的数组
-        if avg_calls is None or len(avg_calls) == 0:
-            return np.zeros(self.F)
-        
-        base_rate = np.array(avg_calls) / 5  # 每分钟呼叫率
-        
-        # 确保base_rate是非负的
-        base_rate = np.maximum(0, np.nan_to_num(base_rate, nan=0.0))
-        
-        time_factor = 1.0
-        
-        # 时间变化因子
-        if current_time < 30:
-            time_factor = 1.0 + 0.5 * (current_time / 30)
-        else:
-            time_factor = 1.5 - 0.5 * ((current_time - 30) / 30)
-        
-        # 计算lambda参数，确保非负
-        lam = np.maximum(0, base_rate * time_factor * 5)
-        
-        # 生成泊松分布的到达
-        arrivals = np.random.poisson(lam)
-        
-        return arrivals
-    
-    def simulate_step_waiting(self, arrivals):
-        """模拟一步的等待时间"""
-        total_wait = 0
-        
-        for floor in range(self.F):
-            num_passengers = arrivals[floor]
-            if num_passengers > 0:
-                # 找到最近的空闲电梯
-                min_distance = float('inf')
-                for elevator in self.elevator_states:
-                    if elevator['status'] == 'idle':
-                        distance = abs(elevator['current_floor'] - (floor + 1))
-                        if distance < min_distance:
-                            min_distance = distance
-                
-                if min_distance < float('inf'):
-                    # 计算等待时间
-                    travel_time = min_distance / self.speed
-                    wait_time = travel_time + self.door_time + 5  # 额外响应时间
-                    total_wait += num_passengers * wait_time
-        
-        return total_wait
-    
 
-def run_complete_simulation():
-    """运行完整的仿真验证"""
+
+def run_analysis_and_simulation():
+    """运行完整的分析和仿真"""
     
-    print("=" * 60)
-    print("电梯MPC停车策略仿真验证")
-    print("=" * 60)
+    print("=" * 70)
+    print("电梯MPC停车策略优化系统 v2.0")
+    print("=" * 70)
     
-    # 创建MPC控制器
-    controller = ElevatorMPCController(num_elevators=6, num_floors=14, prediction_horizon=3)
+    # 1. 数据分析
+    analyzer = ElevatorDataAnalyzer()
+    analyzer.load_data()
     
-    # 定义测试策略
+    # 分析数据模式
+    call_patterns = analyzer.analyze_hall_call_patterns()
+    elevator_params = analyzer.analyze_elevator_travel_times()
+    load_patterns = analyzer.analyze_passenger_load()
+    
+    # 2. 创建MPC控制器
+    controller = ElevatorMPCController(analyzer)
+    
+    # 3. 定义测试策略
     strategies = {
-        'MPC动态策略': 'mpc',
-        '固定大堂策略': 'lobby',  # 所有电梯停在大堂
-        '固定顶层策略': 'top',    # 所有电梯停在顶层
-        '均匀分布策略': 'uniform', # 均匀分布
-        '保持原位策略': 'stay'     # 停在最后位置
+        'MPC优化策略': 'mpc',
+        '固定大堂策略': 'lobby',
+        '均匀分布策略': 'uniform',
+        '需求导向策略': 'demand'
     }
     
-    # 时间段持续时间（分钟）
+    # 时间段时长
     period_durations = {
-        'A': 150,  # 07:00-09:30
-        'B': 90,   # 09:30-11:00
-        'C': 150,  # 11:00-13:30
-        'D': 210,  # 13:30-17:00
-        'E': 60,   # 17:00-18:00
-        'F': 120,  # 18:00-20:00
-        'G': 120,  # 20:00-22:00
-        'H': 540   # 22:00-07:00
+        'A': 150, 'B': 90, 'C': 150, 'D': 210,
+        'E': 60, 'F': 120, 'G': 120, 'H': 540
     }
     
-    # 存储结果
-    results = {strategy: {period: [] for period in time_periods.keys()} 
-               for strategy in strategies.keys()}
+    # 4. 运行仿真
+    print("\n" + "=" * 70)
+    print("开始仿真测试")
+    print("=" * 70)
     
-    # 对每个策略进行测试
+    results = {strategy: {} for strategy in strategies.keys()}
+    
     for strategy_name, strategy_type in strategies.items():
         print(f"\n测试策略: {strategy_name}")
-        print("-" * 40)
+        print("-" * 50)
         
-        for period in time_periods.keys():
-            print(f"\n时间段 {period}: {time_periods[period][0]} - {time_periods[period][1]}")
-            
-            # 初始化电梯位置
+        for period in analyzer.time_periods.keys():
+            # 设置初始位置
             if strategy_type == 'lobby':
-                initial_positions = [1] * 6  # 全在大堂
-            elif strategy_type == 'top':
-                initial_positions = [14] * 6  # 全在顶层
+                initial_positions = [1] * controller.E
             elif strategy_type == 'uniform':
-                initial_positions = [3, 5, 7, 9, 11, 13]  # 均匀分布
-            elif strategy_type == 'stay':
-                # 使用上一时间段结束的位置
-                if period == 'A':
-                    initial_positions = [3, 5, 7, 9, 11, 13]
-                else:
-                    # 在实际仿真中，这会来自上一时段的结果
-                    initial_positions = [3, 5, 7, 9, 11, 13]
-            else:  # MPC策略
-                initial_positions = [3, 5, 7, 9, 11, 13]
+                initial_positions = list(np.linspace(2, controller.F-1, controller.E, dtype=int))
+            elif strategy_type == 'demand':
+                # 基于需求的初始位置
+                peak_floors = analyzer.get_peak_floors(period, is_weekday=True, top_n=controller.E)
+                initial_positions = list(peak_floors)[:controller.E]
+            else:  # MPC
+                initial_positions = list(np.linspace(2, controller.F-1, controller.E, dtype=int))
+            
+            # 确保足够的位置
+            while len(initial_positions) < controller.E:
+                initial_positions.append(controller.F // 2)
             
             controller.initialize_elevators(initial_positions)
             
-            # 获取对应的时间段模式
-            if period == 'H':
-                pattern = weekday_patterns[period]
-            else:
-                pattern = weekday_patterns[period] if np.random.random() > 0.5 else weekend_patterns[period]
-            
             # 运行仿真
             if strategy_type == 'mpc':
-                performance = controller.simulate_period(
-                    pattern, period_durations[period], is_weekday=True
-                )
+                perf = controller.simulate_period(period, period_durations[period], is_weekday=True)
             else:
-                # 对于非MPC策略，使用简化仿真
-                performance = simulate_fixed_strategy(
-                    controller, pattern, period_durations[period], strategy_type
-                )
+                # 固定策略仿真
+                perf = simulate_fixed_strategy(controller, analyzer, period, 
+                                              period_durations[period], strategy_type)
             
-            results[strategy_name][period] = performance
+            results[strategy_name][period] = perf
             
-            print(f"  平均等待时间: {performance['avg_waiting_time']:.1f}秒")
-            print(f"  服务乘客数: {performance['total_passengers']:.0f}")
-            print(f"  总移动距离: {performance['total_movement']:.0f}层")
+            print(f"  {period}段: 平均等待{perf['avg_waiting_time']:.1f}秒, "
+                  f"乘客{perf['total_passengers']:.0f}人")
     
-    return results
+    # 5. 分析结果
+    analyze_results(results, analyzer)
+    
+    # 6. 生成建议
+    generate_recommendations(results, analyzer, controller)
+    
+    return results, analyzer, controller
 
-def simulate_fixed_strategy(controller, pattern, duration_minutes, strategy_type):
+
+def simulate_fixed_strategy(controller, analyzer, period, duration_minutes, strategy_type):
     """模拟固定策略"""
-    total_waiting = 0
+    total_wait = 0
     total_passengers = 0
     total_movement = 0
     
-    simulation_steps = duration_minutes // 5
+    steps = duration_minutes // 5
     
-    for step in range(simulation_steps):
-        # 生成实际到达
-        current_time = step * 5
-        arrivals = controller.generate_actual_arrivals(pattern, current_time)
+    # 获取固定位置
+    if strategy_type == 'lobby':
+        positions = [1] * controller.E
+    elif strategy_type == 'uniform':
+        positions = list(np.linspace(2, controller.F-1, controller.E, dtype=int))
+    elif strategy_type == 'demand':
+        peak_floors = analyzer.get_peak_floors(period, top_n=controller.E)
+        positions = list(peak_floors)[:controller.E]
+    else:
+        positions = [controller.F // 2] * controller.E
+    
+    for step in range(steps):
+        # 预测需求
+        demand = controller.predict_demand(period, True, 1)[0]
         
         # 计算等待时间
-        step_wait = 0
-        for floor in range(controller.F):
-            num_pass = arrivals[floor]
-            if num_pass > 0:
-                # 计算到最近电梯的距离
-                if strategy_type == 'lobby':
-                    distance = abs(1 - (floor + 1))  # 所有电梯在1楼
-                elif strategy_type == 'top':
-                    distance = abs(14 - (floor + 1))  # 所有电梯在14楼
-                elif strategy_type == 'uniform':
-                    # 找到最近的均匀分布电梯
-                    uniform_positions = [3, 5, 7, 9, 11, 13]
-                    distances = [abs(pos - (floor + 1)) for pos in uniform_positions]
-                    distance = min(distances)
-                else:  # stay策略
-                    # 使用当前位置
-                    distances = [abs(e['current_floor'] - (floor + 1)) 
-                                for e in controller.elevator_states]
-                    distance = min(distances)
-                
-                travel_time = distance / controller.speed
-                wait_time = travel_time + controller.door_time + 5
-                step_wait += num_pass * wait_time
-        
-        total_waiting += step_wait
-        total_passengers += np.sum(arrivals)
-        
-        # 更新电梯状态（对于固定策略，只有stay策略会移动）
-        if strategy_type == 'stay':
-            # 模拟电梯响应呼叫
-            for elevator in controller.elevator_states:
-                # 简单模拟：如果有呼叫，移动到最近的呼叫楼层
-                if np.sum(arrivals) > 0 and elevator['status'] == 'idle':
-                    # 找到最近的呼叫
-                    call_floors = np.where(arrivals > 0)[0] + 1
-                    if len(call_floors) > 0:
-                        nearest = min(call_floors, 
-                                     key=lambda x: abs(x - elevator['current_floor']))
-                        distance = abs(nearest - elevator['current_floor'])
-                        total_movement += distance
-                        elevator['current_floor'] = nearest
+        wait = controller.calculate_expected_wait_time(positions, demand)
+        total_wait += wait
+        total_passengers += demand.sum()
     
-    avg_waiting = total_waiting / max(total_passengers, 1)
+    avg_wait = total_wait / max(total_passengers, 1)
     
     return {
-        'avg_waiting_time': avg_waiting,
+        'avg_waiting_time': avg_wait,
         'total_passengers': total_passengers,
         'total_movement': total_movement,
-        'decisions_made': simulation_steps,
-        'final_positions': [e['current_floor'] for e in controller.elevator_states]
+        'decisions_made': steps,
+        'final_positions': positions
     }
 
-def analyze_and_visualize_results(results):
-    """分析和可视化结果"""
+
+def analyze_results(results, analyzer):
+    """分析仿真结果"""
     
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("性能对比分析")
-    print("=" * 60)
+    print("=" * 70)
     
-    # 汇总每个策略的总性能
+    # 汇总每个策略的性能
     summary = {}
-    
     for strategy_name in results.keys():
-        total_waiting = 0
-        total_weighted_waiting = 0
+        total_weighted_wait = 0
         total_passengers = 0
         
         for period in results[strategy_name]:
             perf = results[strategy_name][period]
-            if perf:
-                total_waiting += perf['avg_waiting_time']
-                total_weighted_waiting += perf['avg_waiting_time'] * perf['total_passengers']
-                total_passengers += perf['total_passengers']
+            total_weighted_wait += perf['avg_waiting_time'] * perf['total_passengers']
+            total_passengers += perf['total_passengers']
         
-        avg_overall = total_weighted_waiting / max(total_passengers, 1)
+        avg_wait = total_weighted_wait / max(total_passengers, 1)
         summary[strategy_name] = {
-            'avg_waiting': avg_overall,
+            'avg_waiting': avg_wait,
             'total_passengers': total_passengers
         }
     
-    # 打印汇总
-    print("\n各策略全天平均等待时间:")
+    # 打印排名
+    print("\n各策略全天平均等待时间排名:")
     sorted_strategies = sorted(summary.items(), key=lambda x: x[1]['avg_waiting'])
-    for strategy_name, data in sorted_strategies:
-        print(f"  {strategy_name}: {data['avg_waiting']:.1f}秒")
+    for i, (name, data) in enumerate(sorted_strategies, 1):
+        print(f"  {i}. {name}: {data['avg_waiting']:.1f}秒")
     
-    # 可视化
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    
-    # 1. 各策略平均等待时间对比
-    ax1 = axes[0, 0]
-    strategies = list(summary.keys())
-    avg_waits = [summary[s]['avg_waiting'] for s in strategies]
-    colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D', '#6BAA75']
-    
-    bars = ax1.bar(strategies, avg_waits, color=colors[:len(strategies)])
-    ax1.set_ylabel('平均等待时间(秒)')
-    ax1.set_title('各策略全天平均等待时间对比')
-    ax1.grid(True, alpha=0.3)
-    
-    # 在柱子上添加数值
-    for bar, value in zip(bars, avg_waits):
-        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                f'{value:.1f}', ha='center', va='bottom')
-    
-    # 2. 各时间段MPC策略表现
-    ax2 = axes[0, 1]
-    periods = list(time_periods.keys())
-    mpc_waits = [results['MPC动态策略'][p]['avg_waiting_time'] 
-                if results['MPC动态策略'][p] else 0 for p in periods]
-    
-    ax2.plot(periods, mpc_waits, 'o-', linewidth=2, markersize=8, color='#2E86AB')
-    ax2.set_xlabel('时间段')
-    ax2.set_ylabel('平均等待时间(秒)')
-    ax2.set_title('MPC策略各时间段表现')
-    ax2.grid(True, alpha=0.3)
-    
-    # 3. 高峰时段对比
-    ax3 = axes[1, 0]
-    peak_periods = ['A', 'C', 'E']  # 早高峰、午餐、晚高峰
-    peak_data = {}
-    
-    for strategy in strategies:
-        peak_data[strategy] = [results[strategy][p]['avg_waiting_time'] 
-                              if results[strategy][p] else 0 for p in peak_periods]
-    
-    x = np.arange(len(peak_periods))
-    width = 0.15
-    
-    for i, strategy in enumerate(strategies):
-        offset = (i - len(strategies)/2) * width + width/2
-        ax3.bar(x + offset, peak_data[strategy], width, label=strategy,
-               color=colors[i])
-    
-    ax3.set_xlabel('高峰时段')
-    ax3.set_ylabel('平均等待时间(秒)')
-    ax3.set_title('各策略在高峰时段的表现')
-    ax3.set_xticks(x)
-    ax3.set_xticklabels(['早高峰', '午餐', '晚高峰'])
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-    
-    # 4. 等待时间分布
-    ax4 = axes[1, 1]
-    
-    # 模拟等待时间分布
-    np.random.seed(42)
-    mpc_wait_times = np.random.normal(25, 8, 1000)  # MPC策略
-    lobby_wait_times = np.random.normal(40, 12, 1000)  # 大堂策略
-    stay_wait_times = np.random.normal(35, 10, 1000)  # 保持原位
-    
-    ax4.hist(mpc_wait_times, bins=30, alpha=0.5, label='MPC动态策略', color='#2E86AB')
-    ax4.hist(lobby_wait_times, bins=30, alpha=0.5, label='固定大堂策略', color='#A23B72')
-    ax4.hist(stay_wait_times, bins=30, alpha=0.5, label='保持原位策略', color='#F18F01')
-    
-    ax4.set_xlabel('等待时间(秒)')
-    ax4.set_ylabel('频次')
-    ax4.set_title('等待时间分布对比')
-    ax4.legend()
-    ax4.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # 推荐最优策略
+    # 计算改进
     best_strategy = sorted_strategies[0][0]
     best_wait = sorted_strategies[0][1]['avg_waiting']
+    baseline_wait = summary.get('固定大堂策略', {}).get('avg_waiting', best_wait)
     
-    print(f"\n推荐策略: {best_strategy}")
-    print(f"预期平均等待时间: {best_wait:.1f}秒")
+    if baseline_wait > 0:
+        improvement = (baseline_wait - best_wait) / baseline_wait * 100
+        print(f"\n最佳策略 '{best_strategy}' 相比固定大堂策略改进: {improvement:.1f}%")
     
-    # 计算改进百分比
-    baseline = summary['固定大堂策略']['avg_waiting']
-    improvement = (baseline - best_wait) / baseline * 100
-    
-    print(f"相对于固定大堂策略改进: {improvement:.1f}%")
-    
-    return summary
+    # 可视化
+    visualize_results(results, summary, analyzer)
 
-# 运行仿真
-if __name__ == "__main__":
-    # 首先分析数据模式
-    print("正在分析数据模式...")
+
+def visualize_results(results, summary, analyzer):
+    """可视化结果"""
     
-    # 显示周中数据模式
-    print("\n周中各时间段呼叫模式分析:")
-    print("-" * 50)
-    for period, pattern in weekday_patterns.items():
-        print(f"{period}段 ({time_periods[period][0]}-{time_periods[period][1]}):")
-        print(f"  总呼叫: {pattern['total_calls']:.1f}次/5分钟")
-        print(f"  高峰楼层: {pattern['peak_floors']}")
-        print(f"  分布: 1楼{pattern['distribution'][0]*100:.1f}%, "
-              f"14楼{pattern['distribution'][-1]*100:.1f}%")
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    # 运行仿真
-    print("\n开始仿真验证...")
-    results = run_complete_simulation()
+    # 1. 策略对比
+    ax1 = axes[0, 0]
+    strategies = list(summary.keys())
+    waits = [summary[s]['avg_waiting'] for s in strategies]
+    colors = ['#2E86AB', '#A23B72', '#F18F01', '#6BAA75']
     
-    # 分析结果
-    summary = analyze_and_visualize_results(results)
+    bars = ax1.bar(strategies, waits, color=colors[:len(strategies)])
+    ax1.set_ylabel('平均等待时间(秒)')
+    ax1.set_title('各策略全天平均等待时间对比')
+    ax1.tick_params(axis='x', rotation=15)
     
-    # 输出详细建议
-    print("\n" + "=" * 60)
-    print("详细停车策略建议")
-    print("=" * 60)
+    for bar, val in zip(bars, waits):
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f'{val:.1f}', ha='center', va='bottom')
     
-    # 基于MPC仿真结果，给出每个时间段的建议
-    mpc_results = results['MPC动态策略']
+    # 2. 各时间段对比
+    ax2 = axes[0, 1]
+    periods = list(analyzer.time_periods.keys())
     
-    for period in time_periods.keys():
-        if mpc_results[period]:
-            final_positions = mpc_results[period]['final_positions']
-            print(f"\n{period}段 ({time_periods[period][0]}-{time_periods[period][1]}):")
-            print(f"  推荐停车楼层: {sorted(final_positions)}")
+    for i, strategy in enumerate(strategies[:3]):  # 只显示前3个策略
+        period_waits = [results[strategy][p]['avg_waiting_time'] for p in periods]
+        ax2.plot(periods, period_waits, 'o-', label=strategy, color=colors[i])
+    
+    ax2.set_xlabel('时间段')
+    ax2.set_ylabel('平均等待时间(秒)')
+    ax2.set_title('各时间段等待时间对比')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. 各楼层呼叫分布（工作日A段为例）
+    ax3 = axes[1, 0]
+    if 'A' in analyzer.call_patterns:
+        dist = analyzer.call_patterns['A']['weekday']['distribution']
+        floors = np.arange(1, analyzer.num_floors + 1)
+        ax3.bar(floors, dist, color='#2E86AB', alpha=0.7)
+        ax3.set_xlabel('楼层')
+        ax3.set_ylabel('呼叫占比')
+        ax3.set_title('早高峰(A段)各楼层呼叫分布')
+        ax3.set_xticks(floors)
+    
+    # 4. 乘客流量分析
+    ax4 = axes[1, 1]
+    if hasattr(analyzer, 'load_patterns'):
+        periods_list = list(analyzer.load_patterns.keys())
+        passengers_in = [analyzer.load_patterns[p]['passengers_in'].sum() for p in periods_list]
+        passengers_out = [analyzer.load_patterns[p]['passengers_out'].sum() for p in periods_list]
+        
+        x = np.arange(len(periods_list))
+        width = 0.35
+        
+        ax4.bar(x - width/2, passengers_in, width, label='上客', color='#2E86AB')
+        ax4.bar(x + width/2, passengers_out, width, label='下客', color='#A23B72')
+        
+        ax4.set_xlabel('时间段')
+        ax4.set_ylabel('乘客数量')
+        ax4.set_title('各时间段乘客流量')
+        ax4.set_xticks(x)
+        ax4.set_xticklabels(periods_list)
+        ax4.legend()
+    
+    plt.tight_layout()
+    plt.savefig('elevator_mpc_analysis.png', dpi=150, bbox_inches='tight')
+    print("\n图表已保存为 'elevator_mpc_analysis.png'")
+    plt.show()
+
+
+def generate_recommendations(results, analyzer, controller):
+    """生成停车策略建议"""
+    
+    print("\n" + "=" * 70)
+    print("停车策略建议")
+    print("=" * 70)
+    
+    mpc_results = results.get('MPC优化策略', {})
+    
+    for period, (start, end) in analyzer.time_periods.items():
+        print(f"\n{period}段 ({start}-{end}):")
+        
+        # 获取高需求楼层
+        if period in analyzer.call_patterns:
+            dist = analyzer.call_patterns[period]['weekday']['distribution']
+            top_floors = np.argsort(dist)[-5:][::-1] + 1
+            print(f"  高需求楼层: {list(top_floors)}")
+        
+        # MPC建议位置
+        if period in mpc_results:
+            positions = mpc_results[period]['final_positions']
+            print(f"  MPC建议停车位置: {sorted(positions)}")
             print(f"  预期等待时间: {mpc_results[period]['avg_waiting_time']:.1f}秒")
-            
-            # 给出具体建议
-            if period in ['A', 'E']:  # 高峰时段
-                print("  建议: 重点覆盖1楼和中间楼层，快速响应大堂客流")
-            elif period in ['C', 'F']:  # 餐饮时段
-                print("  建议: 均匀分布，覆盖餐饮楼层")
-            elif period == 'H':  # 夜间
-                print("  建议: 集中在中间楼层，减少移动")
+        
+        # 特定时段建议
+        if period in ['A', 'E']:
+            print("  策略建议: 高峰时段，增加大堂和主要办公楼层覆盖")
+        elif period in ['C', 'F']:
+            print("  策略建议: 餐饮时段，覆盖餐饮楼层和大堂")
+        elif period == 'H':
+            print("  策略建议: 夜间低需求，集中在中间楼层节能")
+        else:
+            print("  策略建议: 常规时段，均匀分布响应随机需求")
+
+
+# 主程序
+if __name__ == "__main__":
+    results, analyzer, controller = run_analysis_and_simulation()
